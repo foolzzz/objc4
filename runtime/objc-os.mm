@@ -741,9 +741,8 @@ void _objc_atfork_prepare()
     loadMethodLock.lock();
     PropertyLocks.lockAll();
     CppObjectLocks.lockAll();
-    AssociationsManagerLock.lock();
-    SideTableLockAll();
     classInitLock.enter();
+    SideTableLockAll();
 #if __OBJC2__
     runtimeLock.write();
     DemangleCacheLock.lock();
@@ -757,6 +756,7 @@ void _objc_atfork_prepare()
     cacheUpdateLock.lock();
     objcMsgLogLock.lock();
     AltHandlerDebugLock.lock();
+    AssociationsManagerLock.lock();
     StructLocks.lockAll();
     crashlog_lock.lock();
 
