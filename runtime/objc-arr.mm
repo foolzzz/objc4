@@ -130,19 +130,6 @@ public:
             new (&table_buf[i * SIDE_TABLE_SIZE]) SideTable;
         }
     }
-    
-    static bool noLocksHeld(void) {
-        bool gotAll = true;
-        for (int i = 0; i < SIDE_TABLE_STRIPE && gotAll; i++) {
-            SideTable *s = (SideTable *)(&table_buf[i * SIDE_TABLE_SIZE]);
-            if (OSSpinLockTry(&s->slock)) {
-                OSSpinLockUnlock(&s->slock);
-            } else {
-                gotAll = false;
-            }
-        }
-        return gotAll;
-    }
 };
 
 STATIC_ASSERT(sizeof(SideTable) <= SIDE_TABLE_SIZE);
@@ -155,10 +142,6 @@ SideTable::table_buf[SIDE_TABLE_STRIPE * SIDE_TABLE_SIZE];
 // anonymous namespace
 };
 
-bool noSideTableLocksHeld(void)
-{
-    return SideTable::noLocksHeld();
-}
 
 //
 // The -fobjc-arr flag causes the compiler to issue calls to objc_{retain/release/autorelease/retain_block}
