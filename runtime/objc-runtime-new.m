@@ -1759,7 +1759,6 @@ static void removeFutureClass(const char *name)
 /***********************************************************************
 * remappedClasses
 * Returns the oldClass => newClass map for realized future classes.
-* Returns the oldClass => NULL map for ignored weak-linked classes.
 * Locking: runtimeLock must be read- or write-locked by the caller
 **********************************************************************/
 static NXMapTable *remappedClasses(BOOL create)
@@ -1798,7 +1797,6 @@ static BOOL noClassesRemapped(void)
 /***********************************************************************
 * addRemappedClass
 * newcls is a realized future class, replacing oldcls.
-* OR newcls is NULL, replacing ignored weak-linked class oldcls.
 * Locking: runtimeLock must be write-locked by the caller
 **********************************************************************/
 static void addRemappedClass(class_t *oldcls, class_t *newcls)
@@ -1820,29 +1818,20 @@ static void addRemappedClass(class_t *oldcls, class_t *newcls)
 * remapClass
 * Returns the live class pointer for cls, which may be pointing to 
 * a class struct that has been reallocated.
-* Returns NULL if cls is ignored because of weak linking.
 * Locking: runtimeLock must be read- or write-locked by the caller
 **********************************************************************/
 static class_t *remapClass(class_t *cls)
 {
     rwlock_assert_locked(&runtimeLock);
 
-    class_t *c2;
-
-    if (!cls) return NULL;
-
-    if (NXMapMember(remappedClasses(YES), cls, (void**)&c2) == NX_MAPNOTAKEY) {
-        return cls;
-    } else {
-        return c2;
-    }
+    class_t *newcls = NXMapGet(remappedClasses(YES), cls);
+    return newcls ? newcls : cls;
 }
 
 
 /***********************************************************************
 * remapClassRef
-* Fix up a class ref, in case the class referenced has been reallocated 
-* or is an ignored weak-linked class.
+* Fix up a class ref, in case the class referenced has been reallocated.
 * Locking: runtimeLock must be read- or write-locked by the caller
 **********************************************************************/
 static void remapClassRef(class_t **clsref)
@@ -2246,28 +2235,6 @@ static class_t *getClass(const char *name)
 
 
 /***********************************************************************
-* missingWeakSuperclass
-* Return YES if some superclass of cls was weak-linked and is missing.
-**********************************************************************/
-static BOOL 
-missingWeakSuperclass(class_t *cls)
-{
-    assert(!isRealized(cls));
-
-    if (!cls->superclass) {
-        // superclass NULL. This is normal for root classes only.
-        return (!(cls->data->flags & RO_ROOT));
-    } else {
-        // superclass not NULL. Check if a higher superclass is missing.
-        class_t *supercls = remapClass(cls->superclass);
-        if (!supercls) return YES;
-        if (isRealized(supercls)) return NO;
-        return missingWeakSuperclass(supercls);
-    }
-}
-
-
-/***********************************************************************
 * realizeAllClassesInImage
 * Non-lazily realizes all unrealized classes in the given image.
 * Locking: runtimeLock must be held by the caller.
@@ -2574,20 +2541,6 @@ __private_extern__ void _read_images(header_info **hList, uint32_t hCount)
         class_t **classlist = _getObjc2ClassList(hi, &count);
         for (i = 0; i < count; i++) {
             const char *name = getName(classlist[i]);
-            
-            if (missingWeakSuperclass(classlist[i])) {
-                // No superclass (probably weak-linked). 
-                // Disavow any knowledge of this subclass.
-                if (PrintConnecting) {
-                    _objc_inform("CLASS: IGNORING class '%s' with "
-                                 "missing weak-linked superclass", name);
-                }
-                addRemappedClass(classlist[i], NULL);
-                classlist[i]->superclass = NULL;
-                classlist[i] = NULL;
-                continue;
-            }
-
             if (NXCountMapTable(future_class_map) > 0) {
                 class_t *newCls = NXMapGet(future_class_map, name);
                 if (newCls) {
@@ -2719,18 +2672,6 @@ __private_extern__ void _read_images(header_info **hList, uint32_t hCount)
             // Do NOT use cat->cls! It may have been remapped.
             class_t *cls = remapClass(cat->cls);
 
-            if (!cls) {
-                // Category's target class is missing (probably weak-linked).
-                // Disavow any knowledge of this category.
-                catlist[i] = NULL;
-                if (PrintConnecting) {
-                    _objc_inform("CLASS: IGNORING category \?\?\?(%s) %p with "
-                                 "missing weak-linked target class", 
-                                 cat->name, cat);
-                }
-                continue;
-            }
-
             // Process this category. 
             // First, register the category with its target class. 
             // Then, rebuild the class's method lists (etc) if 
@@ -2785,13 +2726,12 @@ __private_extern__ void _read_images(header_info **hList, uint32_t hCount)
 // cls must already be connected.
 static void schedule_class_load(class_t *cls)
 {
-    if (!cls) return;
     assert(isRealized(cls));  // _read_images should realize
 
     if (cls->data->flags & RW_LOADED) return;
 
-    // Ensure superclass-first ordering
-    schedule_class_load(getSuperclass(cls));
+    class_t *supercls = getSuperclass(cls);
+    if (supercls) schedule_class_load(supercls);
 
     add_class_to_loadable_list((Class)cls);
     changeInfo(cls, RW_LOADED, 0); 
@@ -2806,7 +2746,8 @@ __private_extern__ void prepare_load_methods(header_info *hi)
     class_t **classlist = 
         _getObjc2NonlazyClassList(hi, &count);
     for (i = 0; i < count; i++) {
-        schedule_class_load(remapClass(classlist[i]));
+        class_t *cls = remapClass(classlist[i]);
+        schedule_class_load(cls);
     }
 
     category_t **categorylist = _getObjc2NonlazyCategoryList(hi, &count);
@@ -2814,7 +2755,6 @@ __private_extern__ void prepare_load_methods(header_info *hi)
         category_t *cat = categorylist[i];
         // Do NOT use cat->cls! It may have been remapped.
         class_t *cls = remapClass(cat->cls);
-        if (!cls) continue;  // category for ignored weak-linked class
         realizeClass(cls);
         assert(isRealized(cls->isa));
         add_category_to_loadable_list((Category)cat);
@@ -2839,10 +2779,7 @@ __private_extern__ void _unload_image(header_info *hi)
     category_t **catlist = _getObjc2CategoryList(hi, &count);
     for (i = 0; i < count; i++) {
         category_t *cat = catlist[i];
-        if (!cat) continue;  // category for ignored weak-linked class
         class_t *cls = remapClass(cat->cls);
-        assert(cls);  // shouldn't have live category for dead class
-
         // fixme for MH_DYLIB cat's class may have been unloaded already
 
         // unattached list
@@ -2858,12 +2795,9 @@ __private_extern__ void _unload_image(header_info *hi)
     for (i = 0; i < count; i++) {
         class_t *cls = classlist[i];
         // fixme remapped classes?
-        // fixme ignored weak-linked classes
-        if (cls) {
-            remove_class_from_loadable_list((Class)cls);
-            unload_class(cls->isa, YES);
-            unload_class(cls, NO);
-        }
+        remove_class_from_loadable_list((Class)cls);
+        unload_class(cls->isa, YES);
+        unload_class(cls, NO);
     }
     
     // Clean up protocols.
@@ -3794,7 +3728,7 @@ class_copyProtocolList(Class cls_gen, unsigned int *outCount)
 __private_extern__ const char **
 _objc_copyClassNamesForImage(header_info *hi, unsigned int *outCount)
 {
-    size_t count, i, shift;
+    size_t count, i;
     class_t **classlist;
     const char **names;
     
@@ -3803,16 +3737,9 @@ _objc_copyClassNamesForImage(header_info *hi, unsigned int *outCount)
     classlist = _getObjc2ClassList(hi, &count);
     names = malloc((count+1) * sizeof(const char *));
     
-    shift = 0;
     for (i = 0; i < count; i++) {
-        class_t *cls = remapClass(classlist[i]);
-        if (cls) {
-            names[i-shift] = getName(classlist[i]);
-        } else {
-            shift++;  // ignored weak-linked class
-        }
+        names[i] = getName(classlist[i]);
     }
-    count -= shift;
     names[count] = NULL;
 
     rwlock_unlock_read(&runtimeLock);
